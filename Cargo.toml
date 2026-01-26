@@ -2,6 +2,12 @@
 name = "filereducelib"
 version = "0.1.0"
 edition = "2021"
+description = "High-performance, constant-memory compression library for structured data (JSONL) producing .fra archives."
+license = "MIT"
+repository = "https://github.com/Omar52344/filereducelib"
+readme = "README.md"
+keywords = ["compression", "jsonl", "big-data", "streaming", "zstd"]
+categories = ["compression", "data-structures", "encoding"]
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }

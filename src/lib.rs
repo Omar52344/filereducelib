@@ -1,4 +1,4 @@
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 
 use hashbrown::HashMap as HbHashMap;
 use rayon::prelude::*;
@@ -19,9 +19,14 @@ pub enum FileReduceError {
     Decompression(String),
     #[error("Format Error: Invalid Magic or Version")]
     FormatError,
+    #[error("Seek Error: Record not found")]
+    RecordNotFound,
 }
 
 pub type Result<T> = std::result::Result<T, FileReduceError>;
+
+const MAGIC: [u8; 4] = [0x46, 0x52, 0x41, 0x02]; // "FRA" + 0x02 (Version 2)
+const CHUNK_SIZE: usize = 1000; // Records per block
 
 /// Represents the simplified value types for our binary format.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -36,40 +41,58 @@ pub enum BinaryValue {
     Object(Vec<(u16, BinaryValue)>), // Keys are compressed to u16 IDs
 }
 
-/// Internal packet types for the .fra stream
+/// A block of compressed records.
+/// In V2, we only serialize this, compress it, and write it as a frame.
 #[derive(Serialize, Deserialize, Debug)]
-enum FraPacket {
-    /// Define a new key mapping: ID -> String
-    DefineKey(u16, String),
-    /// A block of compressed records
-    Block(Vec<BinaryValue>),
+struct BlockData {
+    records: Vec<BinaryValue>,
 }
 
-/// The Header of the .fra file
+/// The Header of the .fra file (Start of file)
 #[derive(Serialize, Deserialize, Debug)]
 pub struct FraHeader {
     pub magic: [u8; 4],
     pub version: u8,
-    // Initial dictionary could be here, but we use dynamic updates in the stream
-    pub initial_dict_size: u32,
 }
 
-const MAGIC: [u8; 4] = [0x46, 0x52, 0x41, 0x01]; // "FRA" + 0x01
+/// The Index Map entry
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct IndexEntry {
+    pub start_record_id: u64, // The global record ID (0-indexed) this block starts with
+    pub byte_offset: u64,     // The absolute byte offset in the file where the block frame starts
+}
+
+/// The Footer of the .fra file (End of file)
+/// Contains the complete Dictionary and the Index for Random Access.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct FraFooter {
+    pub final_dictionary: HbHashMap<u16, String>,
+    pub index: Vec<IndexEntry>,
+    pub total_records: u64,
+}
 
 /// Main Compressor Struct
 pub struct FileReduceCompressor {
     dict: HbHashMap<String, u16>,
     next_id: u16,
+    index: Vec<IndexEntry>,
+    total_records: u64,
 }
 
 /// Main Decompressor Struct
 pub struct FileReduceDecompressor {
     dict: HbHashMap<u16, String>,
+    index: Vec<IndexEntry>,
+    total_records: u64,
 }
 
 pub trait Compressor {
-    fn compress<R: Read, W: Write>(&mut self, input: R, output: W) -> Result<()>;
-    fn decompress<R: Read, W: Write>(&mut self, input: R, output: W) -> Result<()>;
+    fn compress<W: Write + Seek>(&mut self, input: impl Read, output: W) -> Result<()>;
+}
+
+pub trait Decompressor {
+    fn decompress<R: Read + Seek, W: Write>(&mut self, input: R, output: W) -> Result<()>;
+    fn seek_record<R: Read + Seek>(&mut self, input: &mut R, record_id: u64) -> Result<Value>;
 }
 
 impl FileReduceCompressor {
@@ -77,61 +100,64 @@ impl FileReduceCompressor {
         Self {
             dict: HbHashMap::new(),
             next_id: 1, // Start IDs at 1
+            index: Vec::new(),
+            total_records: 0,
         }
     }
 
-    /// Helper to convert standard JSON Value to our BinaryValue, updating dict as needed.
-    fn process_chunk(&mut self, chunk: Vec<Value>) -> (Vec<FraPacket>, Vec<BinaryValue>) {
-        let mut key_events = Vec::new();
+    /// Process a chunk of JSON Values into BinaryValues and update local dictionary state.
+    fn process_chunk(&mut self, chunk: Vec<Value>) -> Result<Vec<u8>> {
+        // 1. Scan for Keys (Sequential or Parallel Reduce)
+        let mut keys_to_add = Vec::new();
 
-        // First pass: Identify new keys sequentially
-        let mut chunk_keys: Vec<String> = Vec::new();
-
-        // Helper to recursively find keys
-        fn extract_keys(v: &Value, keys: &mut Vec<String>) {
-            match v {
-                Value::Object(map) => {
-                    for (k, v) in map {
-                        keys.push(k.clone());
-                        extract_keys(v, keys);
-                    }
-                }
-                Value::Array(arr) => {
-                    for v in arr {
-                        extract_keys(v, keys);
-                    }
-                }
-                _ => {}
-            }
-        }
-
+        // Use a simple scanner for the chunk
         for record in &chunk {
-            extract_keys(record, &mut chunk_keys);
+            self.scan_keys(record, &mut keys_to_add);
         }
 
-        // Dedup keys and assign IDs for new ones
-        chunk_keys.sort();
-        chunk_keys.dedup();
-
-        for key in chunk_keys {
+        // Update Dictionary
+        for key in keys_to_add {
             if !self.dict.contains_key(&key) {
-                let id = self.next_id;
+                self.dict.insert(key, self.next_id);
                 self.next_id += 1;
-                self.dict.insert(key.clone(), id);
-                key_events.push(FraPacket::DefineKey(id, key));
             }
         }
 
-        // Second pass: Convert values using the (now updated) dict.
-        // This is parallelized with Rayon.
+        // 2. Convert to Binary (Parallel)
+        // We need a read-only view of the dict for Rayon
         let dict_ref = &self.dict;
-
         let binaries: Vec<BinaryValue> = chunk
             .par_iter()
             .map(|v| Self::json_to_binary(v, dict_ref))
             .collect();
 
-        (key_events, binaries)
+        // 3. Serialize BlockData
+        let block = BlockData { records: binaries };
+        let serialized_block = bincode::serialize(&block)?;
+
+        // 4. Compress Independently (Zstd Frame)
+        let compressed_block = zstd::bulk::compress(&serialized_block, 3)?;
+
+        Ok(compressed_block)
+    }
+
+    fn scan_keys(&self, v: &Value, sink: &mut Vec<String>) {
+        match v {
+            Value::Object(map) => {
+                for (k, v) in map {
+                    if !self.dict.contains_key(k) {
+                        sink.push(k.clone());
+                    }
+                    self.scan_keys(v, sink);
+                }
+            }
+            Value::Array(arr) => {
+                for v in arr {
+                    self.scan_keys(v, sink);
+                }
+            }
+            _ => {}
+        }
     }
 
     fn json_to_binary(v: &Value, dict: &HbHashMap<String, u16>) -> BinaryValue {
@@ -155,7 +181,7 @@ impl FileReduceCompressor {
                 let fields = map
                     .iter()
                     .map(|(k, v)| {
-                        let id = dict.get(k).copied().unwrap_or(0); // Should be found
+                        let id = dict.get(k).copied().unwrap_or(0);
                         (id, Self::json_to_binary(v, dict))
                     })
                     .collect();
@@ -165,69 +191,143 @@ impl FileReduceCompressor {
     }
 }
 
-impl Compressor for FileReduceCompressor {
-    fn compress<R: Read, W: Write>(&mut self, input: R, output: W) -> Result<()> {
-        let mut writer = zstd::stream::write::Encoder::new(output, 3)?; // Level 3 default
+// Inherent methods to maintain compatibility and ease of use
+impl FileReduceCompressor {
+    pub fn compress<W: Write + Seek>(&mut self, input: impl Read, output: W) -> Result<()> {
+        <Self as Compressor>::compress(self, input, output)
+    }
+}
 
-        // Write Header
+impl Compressor for FileReduceCompressor {
+    fn compress<W: Write + Seek>(&mut self, input: impl Read, mut output: W) -> Result<()> {
+        // 1. Write Header
         let header = FraHeader {
             magic: MAGIC,
-            version: 1,
-            initial_dict_size: 0,
+            version: 2,
         };
-        bincode::serialize_into(&mut writer, &header)?;
+        bincode::serialize_into(&mut output, &header)?;
+        let mut current_offset = output.stream_position()?;
 
-        // JSONL Iterator
+        // 2. Stream Processing
         let deserializer = serde_json::Deserializer::from_reader(input);
         let iterator = deserializer.into_iter::<Value>();
 
-        let mut buffer = Vec::with_capacity(1000);
-        let chunk_size = 1000;
+        let mut chunk_buffer = Vec::with_capacity(CHUNK_SIZE);
 
         for item in iterator {
             let val = item?;
-            buffer.push(val);
+            chunk_buffer.push(val);
 
-            if buffer.len() >= chunk_size {
-                let (packets, binaries) = self.process_chunk(buffer);
+            if chunk_buffer.len() >= CHUNK_SIZE {
+                // Process Chunk
+                let compressed_data = self.process_chunk(chunk_buffer)?;
+                let compressed_len = compressed_data.len() as u32;
 
-                // Write definitions
-                for p in packets {
-                    bincode::serialize_into(&mut writer, &p)?;
-                }
+                // Record Index
+                self.index.push(IndexEntry {
+                    start_record_id: self.total_records,
+                    byte_offset: current_offset,
+                });
+                self.total_records += CHUNK_SIZE as u64;
 
-                // Write data block
-                bincode::serialize_into(&mut writer, &FraPacket::Block(binaries))?;
+                // Write Frame: [Length u32] [Data]
+                output.write_all(&compressed_len.to_le_bytes())?;
+                output.write_all(&compressed_data)?;
 
-                buffer = Vec::with_capacity(chunk_size);
+                current_offset = output.stream_position()?;
+                chunk_buffer = Vec::with_capacity(CHUNK_SIZE);
             }
         }
 
         // Flush remaining
-        if !buffer.is_empty() {
-            let (packets, binaries) = self.process_chunk(buffer);
-            for p in packets {
-                bincode::serialize_into(&mut writer, &p)?;
-            }
-            bincode::serialize_into(&mut writer, &FraPacket::Block(binaries))?;
+        if !chunk_buffer.is_empty() {
+            let processed_count = chunk_buffer.len() as u64;
+            let compressed_data = self.process_chunk(chunk_buffer)?;
+            let compressed_len = compressed_data.len() as u32;
+
+            self.index.push(IndexEntry {
+                start_record_id: self.total_records,
+                byte_offset: current_offset,
+            });
+            self.total_records += processed_count;
+
+            output.write_all(&compressed_len.to_le_bytes())?;
+            output.write_all(&compressed_data)?;
+            current_offset = output.stream_position()?;
         }
 
-        writer.finish()?;
-        Ok(())
-    }
+        // 3. Write Footer
+        let footer_start = current_offset;
 
-    fn decompress<R: Read, W: Write>(&mut self, _input: R, _output: W) -> Result<()> {
-        Err(FileReduceError::Decompression(
-            "Compressor cannot decompress. Use FileReduceDecompressor.".into(),
-        ))
+        let mut final_dict_rev = HbHashMap::new();
+        for (k, v) in &self.dict {
+            final_dict_rev.insert(*v, k.clone());
+        }
+
+        let footer = FraFooter {
+            final_dictionary: final_dict_rev,
+            index: self.index.clone(),
+            total_records: self.total_records,
+        };
+
+        let footer_bytes = bincode::serialize(&footer)?;
+        output.write_all(&footer_bytes)?;
+
+        // 4. Write Footer Metadata
+        // [Footer Start Offset u64] [Magic u32]
+        output.write_all(&footer_start.to_le_bytes())?;
+        output.write_all(&MAGIC)?;
+
+        Ok(())
     }
 }
 
+// Inherent methods for Decompressor
 impl FileReduceDecompressor {
     pub fn new() -> Self {
         Self {
             dict: HbHashMap::new(),
+            index: Vec::new(),
+            total_records: 0,
         }
+    }
+
+    pub fn decompress<R: Read + Seek, W: Write>(&mut self, input: R, output: W) -> Result<()> {
+        <Self as Decompressor>::decompress(self, input, output)
+    }
+
+    pub fn seek_record<R: Read + Seek>(&mut self, input: &mut R, record_id: u64) -> Result<Value> {
+        <Self as Decompressor>::seek_record(self, input, record_id)
+    }
+
+    fn read_metadata<R: Read + Seek>(&mut self, reader: &mut R) -> Result<u64> {
+        let file_len = reader.seek(SeekFrom::End(0))?;
+        if file_len < 16 {
+            return Err(FileReduceError::FormatError);
+        }
+
+        reader.seek(SeekFrom::End(-12))?;
+
+        let mut buf_u64 = [0u8; 8];
+        let mut buf_magic = [0u8; 4];
+
+        reader.read_exact(&mut buf_u64)?;
+        reader.read_exact(&mut buf_magic)?;
+
+        if buf_magic != MAGIC {
+            return Err(FileReduceError::FormatError);
+        }
+
+        let footer_start = u64::from_le_bytes(buf_u64);
+
+        reader.seek(SeekFrom::Start(footer_start))?;
+        let footer: FraFooter = bincode::deserialize_from(reader)?;
+
+        self.dict = footer.final_dictionary;
+        self.index = footer.index;
+        self.total_records = footer.total_records;
+
+        Ok(footer_start)
     }
 
     fn binary_to_json(&self, val: &BinaryValue) -> Value {
@@ -256,43 +356,83 @@ impl FileReduceDecompressor {
     }
 }
 
-impl Compressor for FileReduceDecompressor {
-    fn compress<R: Read, W: Write>(&mut self, _input: R, _output: W) -> Result<()> {
-        Err(FileReduceError::Decompression(
-            "Decompressor cannot compress. Use FileReduceCompressor.".into(),
-        ))
-    }
+impl Decompressor for FileReduceDecompressor {
+    fn decompress<R: Read + Seek, W: Write>(&mut self, mut input: R, mut output: W) -> Result<()> {
+        let footer_start = self.read_metadata(&mut input)?;
 
-    fn decompress<R: Read, W: Write>(&mut self, input: R, mut output: W) -> Result<()> {
-        let mut reader = zstd::stream::read::Decoder::new(input)?;
-
-        // Read Header
-        let header: FraHeader = bincode::deserialize_from(&mut reader)?;
+        input.seek(SeekFrom::Start(0))?;
+        let header: FraHeader = bincode::deserialize_from(&mut input)?;
         if header.magic != MAGIC {
             return Err(FileReduceError::FormatError);
         }
 
-        // Loop stream
-        loop {
-            // bincode doesn't have a clean 'peek', so we handle errors
-            let packet_res: std::result::Result<FraPacket, bincode::Error> =
-                bincode::deserialize_from(&mut reader);
+        let mut current_pos = input.stream_position()?;
 
-            match packet_res {
-                Ok(FraPacket::DefineKey(id, key)) => {
-                    self.dict.insert(id, key);
-                }
-                Ok(FraPacket::Block(records)) => {
-                    for record in records {
-                        let json_val = self.binary_to_json(&record);
-                        serde_json::to_writer(&mut output, &json_val)?;
-                        output.write_all(b"\n")?;
-                    }
-                }
-                Err(_) => break, // Assume EOF
+        while current_pos < footer_start {
+            let mut len_buf = [0u8; 4];
+            input.read_exact(&mut len_buf)?;
+            let len = u32::from_le_bytes(len_buf) as usize;
+
+            let mut compressed = vec![0u8; len];
+            input.read_exact(&mut compressed)?;
+
+            let decompressed = zstd::bulk::decompress(&compressed, 10_000_000)
+                .map_err(|e| FileReduceError::Decompression(e.to_string()))?;
+
+            let block: BlockData = bincode::deserialize(&decompressed)?;
+
+            for record in block.records {
+                let v = self.binary_to_json(&record);
+                serde_json::to_writer(&mut output, &v)?;
+                output.write_all(b"\n")?;
             }
+
+            current_pos = input.stream_position()?;
         }
+
         Ok(())
+    }
+
+    fn seek_record<R: Read + Seek>(&mut self, input: &mut R, record_id: u64) -> Result<Value> {
+        if self.index.is_empty() {
+            self.read_metadata(input)?;
+        }
+
+        if record_id >= self.total_records {
+            return Err(FileReduceError::RecordNotFound);
+        }
+
+        let block_idx = match self
+            .index
+            .binary_search_by_key(&record_id, |entry| entry.start_record_id)
+        {
+            Ok(idx) => idx,
+            Err(idx) => idx - 1,
+        };
+
+        let entry = &self.index[block_idx];
+
+        input.seek(SeekFrom::Start(entry.byte_offset))?;
+
+        let mut len_buf = [0u8; 4];
+        input.read_exact(&mut len_buf)?;
+        let len = u32::from_le_bytes(len_buf) as usize;
+
+        let mut compressed = vec![0u8; len];
+        input.read_exact(&mut compressed)?;
+
+        let decompressed = zstd::bulk::decompress(&compressed, 10_000_000)
+            .map_err(|e| FileReduceError::Decompression(e.to_string()))?;
+
+        let block: BlockData = bincode::deserialize(&decompressed)?;
+
+        let relative_index = (record_id - entry.start_record_id) as usize;
+        if relative_index >= block.records.len() {
+            return Err(FileReduceError::RecordNotFound);
+        }
+
+        let record_bin = &block.records[relative_index];
+        Ok(self.binary_to_json(record_bin))
     }
 }
 
@@ -308,23 +448,24 @@ mod tests {
 {"name": "Alice", "age": 31, "meta": {"score": 101}}"#;
 
         let mut compressor = FileReduceCompressor::new();
-        let mut compressed_data = Vec::new();
+        let mut compressed_data = Cursor::new(Vec::new());
 
         compressor
             .compress(Cursor::new(jsonl_input), &mut compressed_data)
             .expect("Compression failed");
 
-        assert!(!compressed_data.is_empty());
-        println!("Compressed size: {}", compressed_data.len());
+        let compressed_vec = compressed_data.into_inner();
+        assert!(!compressed_vec.is_empty());
+        println!("Compressed size: {}", compressed_vec.len());
 
         let mut decompressor = FileReduceDecompressor::new();
         let mut output_data = Vec::new();
         decompressor
-            .decompress(Cursor::new(compressed_data), &mut output_data)
+            .decompress(Cursor::new(compressed_vec), &mut output_data)
             .expect("Decompression failed");
 
         let output_str = String::from_utf8(output_data).expect("Invalid UTF8");
-        // Verify output matches input logical structure (ignoring whitespace differences potentially)
+
         let input_lines: Vec<Value> = serde_json::Deserializer::from_str(jsonl_input)
             .into_iter::<Value>()
             .map(|x| x.unwrap())
@@ -335,5 +476,43 @@ mod tests {
             .collect();
 
         assert_eq!(input_lines, output_lines);
+    }
+
+    #[test]
+    fn test_seek_random_access() {
+        let mut jsonl_input = String::new();
+        for i in 0..5000 {
+            jsonl_input.push_str(&format!(r#"{{"id": {}, "data": "record_{}"}}"#, i, i));
+            jsonl_input.push('\n');
+        }
+
+        let mut compressor = FileReduceCompressor::new();
+        let mut compressed_data = Cursor::new(Vec::new());
+        compressor
+            .compress(Cursor::new(&jsonl_input), &mut compressed_data)
+            .expect("Compression failed");
+
+        let compressed_vec = compressed_data.into_inner();
+        let mut decompressor = FileReduceDecompressor::new();
+        let mut cursor = Cursor::new(compressed_vec);
+
+        // Seek Record 2500 (middle)
+        let record_val = decompressor
+            .seek_record(&mut cursor, 2500)
+            .expect("Seek failed");
+        assert_eq!(record_val["id"], 2500);
+        assert_eq!(record_val["data"], "record_2500");
+
+        // Seek Record 0
+        let record_val = decompressor
+            .seek_record(&mut cursor, 0)
+            .expect("Seek failed");
+        assert_eq!(record_val["id"], 0);
+
+        // Seek Last Record
+        let record_val = decompressor
+            .seek_record(&mut cursor, 4999)
+            .expect("Seek failed");
+        assert_eq!(record_val["id"], 4999);
     }
 }

@@ -1,6 +1,7 @@
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
 use hashbrown::HashMap as HbHashMap;
+#[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -123,13 +124,16 @@ impl FileReduceCompressor {
             }
         }
 
-        // 2. Convert to Binary (Parallel)
-        // We need a read-only view of the dict for Rayon
+        // 2. Convert to Binary (Parallel/Sequential)
+        // We need a read-only view of the dict
         let dict_ref = &self.dict;
-        let binaries: Vec<BinaryValue> = chunk
-            .par_iter()
-            .map(|v| Self::json_to_binary(v, dict_ref))
-            .collect();
+        let binaries: Vec<BinaryValue> = {
+            #[cfg(feature = "parallel")]
+            let iter = chunk.par_iter();
+            #[cfg(not(feature = "parallel"))]
+            let iter = chunk.iter();
+            iter.map(|v| Self::json_to_binary(v, dict_ref)).collect()
+        };
 
         // 3. Serialize BlockData
         let block = BlockData { records: binaries };

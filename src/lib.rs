@@ -380,7 +380,7 @@ impl Decompressor for FileReduceDecompressor {
             let mut compressed = vec![0u8; len];
             input.read_exact(&mut compressed)?;
 
-            let decompressed = zstd::bulk::decompress(&compressed, 10_000_000)
+            let decompressed = zstd::stream::decode_all(&compressed[..])
                 .map_err(|e| FileReduceError::Decompression(e.to_string()))?;
 
             let block: BlockData = bincode::deserialize(&decompressed)?;
@@ -425,7 +425,7 @@ impl Decompressor for FileReduceDecompressor {
         let mut compressed = vec![0u8; len];
         input.read_exact(&mut compressed)?;
 
-        let decompressed = zstd::bulk::decompress(&compressed, 10_000_000)
+        let decompressed = zstd::stream::decode_all(&compressed[..])
             .map_err(|e| FileReduceError::Decompression(e.to_string()))?;
 
         let block: BlockData = bincode::deserialize(&decompressed)?;

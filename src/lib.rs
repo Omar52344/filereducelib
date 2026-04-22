@@ -1,6 +1,6 @@
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
-use hashbrown::HashMap as HbHashMap;
+use hashbrown::{HashMap as HbHashMap, HashSet};
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -109,7 +109,7 @@ impl FileReduceCompressor {
     /// Process a chunk of JSON Values into BinaryValues and update local dictionary state.
     fn process_chunk(&mut self, chunk: Vec<Value>) -> Result<Vec<u8>> {
         // 1. Scan for Keys (Sequential or Parallel Reduce)
-        let mut keys_to_add = Vec::new();
+        let mut keys_to_add = HashSet::new();
 
         // Use a simple scanner for the chunk
         for record in &chunk {
@@ -145,22 +145,24 @@ impl FileReduceCompressor {
         Ok(compressed_block)
     }
 
-    fn scan_keys(&self, v: &Value, sink: &mut Vec<String>) {
-        match v {
-            Value::Object(map) => {
-                for (k, v) in map {
-                    if !self.dict.contains_key(k) {
-                        sink.push(k.clone());
+    fn scan_keys(&self, v: &Value, sink: &mut HashSet<String>) {
+        use serde_json::Value;
+        let mut stack = vec![v];
+        while let Some(current) = stack.pop() {
+            match current {
+                Value::Object(map) => {
+                    for (k, v) in map {
+                        if !self.dict.contains_key(k) && !sink.contains(k) {
+                            sink.insert(k.clone());
+                        }
+                        stack.push(v);
                     }
-                    self.scan_keys(v, sink);
                 }
-            }
-            Value::Array(arr) => {
-                for v in arr {
-                    self.scan_keys(v, sink);
+                Value::Array(arr) => {
+                    stack.extend(arr.iter());
                 }
+                _ => {}
             }
-            _ => {}
         }
     }
 
